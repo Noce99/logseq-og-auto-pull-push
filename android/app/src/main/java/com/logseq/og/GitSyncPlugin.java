@@ -73,6 +73,21 @@ public class GitSyncPlugin extends Plugin {
     private static final String KEY_PASSPHRASE = "passphrase";
     private static final String TRUSTED_HOSTS_FILE = "git_sync_trusted_hosts";
 
+    static {
+        // Apache MINA sshd's ClientBuilder/PathUtils statically read the
+        // "user.home" system property the first time any SSH client class is
+        // touched, and throw IllegalArgumentException("No user home") if it's
+        // unset - which it always is on Android (confirmed on-device via
+        // logcat: ExceptionInInitializerError -> IllegalArgumentException: No
+        // user home). We supply our own explicit home/ssh directories per call
+        // (see buildTransportConfigCallback), so the actual value here doesn't
+        // matter - it just needs to be non-null/non-empty so the static
+        // initializer doesn't crash. java.io.tmpdir is always set on Android.
+        if (System.getProperty("user.home") == null || System.getProperty("user.home").isEmpty()) {
+            System.setProperty("user.home", System.getProperty("java.io.tmpdir", "/data/local/tmp"));
+        }
+    }
+
     private JGitKeyCache keyCache;
 
     @Override
