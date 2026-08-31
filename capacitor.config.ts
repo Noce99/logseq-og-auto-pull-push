@@ -8,7 +8,10 @@ const config: CapacitorConfig = {
   appName: 'Logseq OG',
   bundledWebRuntime: false,
   webDir: 'public',
-  loggingBehavior: 'debug',
+  // 'debug' logs full plugin call arguments (including secrets like the
+  // GitSync SSH private key/passphrase) to logcat - keep this at
+  // 'production' unless actively debugging non-sensitive plugin calls.
+  loggingBehavior: 'production',
   server: {
     // https://capacitorjs.com/docs/updating/5-0#update-androidscheme
     androidScheme: 'http',

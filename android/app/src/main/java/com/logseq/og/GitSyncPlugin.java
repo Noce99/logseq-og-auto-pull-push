@@ -75,6 +75,10 @@ public class GitSyncPlugin extends Plugin {
     private static final String KEY_PRIVATE_KEY = "private_key";
     private static final String KEY_PASSPHRASE = "passphrase";
     private static final String TRUSTED_HOSTS_FILE = "git_sync_trusted_hosts";
+    // Without an explicit timeout a stalled SSH connection (bad network, a
+    // server that never responds) hangs the calling thread forever - JGit's
+    // TransportCommand.setTimeout(seconds) is respected by the JSch session.
+    private static final int SSH_TIMEOUT_SECONDS = 20;
 
     // ---- Secure key storage (Keystore-backed, per-app-sandboxed) -----------
 
@@ -149,6 +153,7 @@ public class GitSyncPlugin extends Plugin {
             Collection<Ref> refs = Git.lsRemoteRepository()
                     .setRemote(remoteUrl)
                     .setTransportConfigCallback(cb)
+                    .setTimeout(SSH_TIMEOUT_SECONDS)
                     .call();
             JSObject ret = new JSObject();
             ret.put("ok", true);
@@ -178,7 +183,7 @@ public class GitSyncPlugin extends Plugin {
                 // remote's default branch WITHOUT touching working-tree files,
                 // so any pre-existing local graph files stay intact as
                 // uncommitted changes to be picked up by the next commitAndPush.
-                git.fetch().setTransportConfigCallback(cb).call();
+                git.fetch().setTransportConfigCallback(cb).setTimeout(SSH_TIMEOUT_SECONDS).call();
                 Ref remoteHead = findFirstRemoteBranch(git);
                 if (remoteHead != null) {
                     git.getRepository().updateRef("HEAD").link(remoteHead.getName());
@@ -191,7 +196,7 @@ public class GitSyncPlugin extends Plugin {
                 return;
             }
 
-            PullResult result = git.pull().setTransportConfigCallback(cb).call();
+            PullResult result = git.pull().setTransportConfigCallback(cb).setTimeout(SSH_TIMEOUT_SECONDS).call();
             if (!result.isSuccessful()) {
                 if (isConflict(result)) {
                     abortConflictedMerge(git);
@@ -239,7 +244,7 @@ public class GitSyncPlugin extends Plugin {
             if (!pushed) {
                 // Remote has diverged: try a safe merge, then retry the push once.
                 // Never force-push.
-                PullResult result = git.pull().setTransportConfigCallback(cb).call();
+                PullResult result = git.pull().setTransportConfigCallback(cb).setTimeout(SSH_TIMEOUT_SECONDS).call();
                 if (!result.isSuccessful()) {
                     if (isConflict(result)) {
                         abortConflictedMerge(git);
@@ -274,7 +279,7 @@ public class GitSyncPlugin extends Plugin {
     }
 
     private boolean attemptPush(Git git, TransportConfigCallback cb) throws GitAPIException {
-        Iterable<PushResult> results = git.push().setTransportConfigCallback(cb).call();
+        Iterable<PushResult> results = git.push().setTransportConfigCallback(cb).setTimeout(SSH_TIMEOUT_SECONDS).call();
         for (PushResult result : results) {
             for (RemoteRefUpdate update : result.getRemoteUpdates()) {
                 RemoteRefUpdate.Status status = update.getStatus();
