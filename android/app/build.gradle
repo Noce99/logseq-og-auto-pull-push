@@ -28,6 +28,23 @@ android {
         targetCompatibility JavaVersion.VERSION_11
         coreLibraryDesugaringEnabled true
     }
+    packagingOptions {
+        // JGit/Apache MINA sshd pull in several jars that ship identical
+        // metadata at the same path; it's not needed at runtime.
+        resources {
+            excludes += [
+                'OSGI-INF/l10n/plugin.properties',
+                'about.html',
+                'plugin.properties',
+                'META-INF/DEPENDENCIES',
+                'META-INF/LICENSE',
+                'META-INF/LICENSE.txt',
+                'META-INF/NOTICE',
+                'META-INF/NOTICE.txt',
+                'META-INF/versions/9/OSGI-INF/MANIFEST.MF'
+            ]
+        }
+    }
 }
 
 repositories {
