@@ -18,6 +18,7 @@ import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.Session;
 import com.jcraft.jsch.UserInfo;
 
+import org.eclipse.jgit.api.CreateBranchCommand;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ListBranchCommand;
 import org.eclipse.jgit.api.MergeResult;
@@ -29,6 +30,7 @@ import org.eclipse.jgit.api.errors.CheckoutConflictException;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.transport.PushResult;
 import org.eclipse.jgit.transport.RemoteConfig;
 import org.eclipse.jgit.transport.RemoteRefUpdate;
@@ -186,11 +188,28 @@ public class GitSyncPlugin extends Plugin {
                 git.fetch().setTransportConfigCallback(cb).setTimeout(SSH_TIMEOUT_SECONDS).call();
                 Ref remoteHead = findFirstRemoteBranch(git);
                 if (remoteHead != null) {
-                    git.getRepository().updateRef("HEAD").link(remoteHead.getName());
-                    git.reset()
-                            .setMode(ResetCommand.ResetType.MIXED)
-                            .setRef(remoteHead.getObjectId().getName())
+                    // Point HEAD at a real local branch that tracks the
+                    // remote one - not directly at the remote-tracking ref,
+                    // which confuses JGit's pull machinery ("Cannot check
+                    // out from unborn branch", confirmed on-device) since it
+                    // expects HEAD to follow refs/heads/<name> to look up
+                    // branch.<name>.{remote,merge} tracking config.
+                    String shortName = Repository.shortenRefName(remoteHead.getName()); // e.g. "origin/main"
+                    int slash = shortName.indexOf('/');
+                    String localBranchName = slash >= 0 ? shortName.substring(slash + 1) : shortName;
+
+                    git.branchCreate()
+                            .setName(localBranchName)
+                            .setStartPoint(remoteHead.getName())
+                            .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.TRACK)
                             .call();
+                    String localRef = "refs/heads/" + localBranchName;
+                    git.getRepository().updateRef("HEAD").link(localRef);
+                    // Update HEAD/index to the new commit WITHOUT touching
+                    // working-tree files, so any pre-existing local graph
+                    // files stay intact as uncommitted changes to be picked
+                    // up by the next commitAndPush.
+                    git.reset().setMode(ResetCommand.ResetType.MIXED).setRef(localRef).call();
                 }
                 resolveOk(call, false);
                 return;
