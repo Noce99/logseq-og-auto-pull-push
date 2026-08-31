@@ -1,12 +1,5 @@
 package com.logseq.og;
 
-// NOTE: this plugin was written and reviewed against JGit/Apache MINA sshd's
-// documented API, but could not be compiled here (no Android SDK / JGit jars
-// available in this environment). Build it in Android Studio first and fix
-// any API mismatches against the exact JGit version pinned in build.gradle -
-// the SSH transport wiring (buildTransportConfigCallback) is the part most
-// likely to need small adjustments.
-
 import android.content.SharedPreferences;
 import android.util.Log;
 
@@ -18,6 +11,12 @@ import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.jcraft.jsch.HostKey;
+import com.jcraft.jsch.HostKeyRepository;
+import com.jcraft.jsch.JSch;
+import com.jcraft.jsch.JSchException;
+import com.jcraft.jsch.Session;
+import com.jcraft.jsch.UserInfo;
 
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ListBranchCommand;
@@ -30,31 +29,24 @@ import org.eclipse.jgit.api.errors.CheckoutConflictException;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
-import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.PushResult;
 import org.eclipse.jgit.transport.RemoteConfig;
 import org.eclipse.jgit.transport.RemoteRefUpdate;
+import org.eclipse.jgit.transport.SshSessionFactory;
 import org.eclipse.jgit.transport.SshTransport;
 import org.eclipse.jgit.transport.URIish;
-import org.eclipse.jgit.transport.sshd.JGitKeyCache;
-import org.eclipse.jgit.transport.sshd.KeyPasswordProvider;
-import org.eclipse.jgit.transport.sshd.ServerKeyDatabase;
-import org.eclipse.jgit.transport.sshd.SshdSessionFactory;
-import org.eclipse.jgit.transport.sshd.SshdSessionFactoryBuilder;
+import org.eclipse.jgit.transport.ssh.jsch.JschConfigSessionFactory;
+import org.eclipse.jgit.transport.ssh.jsch.OpenSshConfig;
+import org.eclipse.jgit.util.FS;
 
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.FileWriter;
-import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.Path;
-import java.security.PublicKey;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
 
 /**
@@ -64,6 +56,17 @@ import java.util.List;
  * in a way that can't be fast-forwarded/merged cleanly, calls reject with the
  * "MERGE_CONFLICT" error code and the JS side is expected to pause auto-sync
  * until the user resolves it (e.g. from the desktop app).
+ *
+ * Uses JGit's JSch-based SSH transport (org.eclipse.jgit.ssh.jsch), not the
+ * Apache-MINA-sshd one (org.eclipse.jgit.ssh.apache) - MINA sshd hard-crashes
+ * on Android in two different ways confirmed via on-device logcat:
+ *  1. its ClientBuilder/PathUtils statically require a "user.home" system
+ *     property, which Android never sets (IllegalArgumentException: No user
+ *     home, inside ExceptionInInitializerError).
+ *  2. its default key-exchange algorithm detection (Montgomery curve support
+ *     probing) references javax.management.ReflectionException, which
+ *     doesn't exist on Android (NoClassDefFoundError).
+ * JSch is older/simpler and doesn't pull in either dependency.
  */
 @CapacitorPlugin(name = "GitSync")
 public class GitSyncPlugin extends Plugin {
@@ -72,30 +75,6 @@ public class GitSyncPlugin extends Plugin {
     private static final String KEY_PRIVATE_KEY = "private_key";
     private static final String KEY_PASSPHRASE = "passphrase";
     private static final String TRUSTED_HOSTS_FILE = "git_sync_trusted_hosts";
-
-    static {
-        // Apache MINA sshd's ClientBuilder/PathUtils statically read the
-        // "user.home" system property the first time any SSH client class is
-        // touched, and throw IllegalArgumentException("No user home") if it's
-        // unset - which it always is on Android (confirmed on-device via
-        // logcat: ExceptionInInitializerError -> IllegalArgumentException: No
-        // user home). We supply our own explicit home/ssh directories per call
-        // (see buildTransportConfigCallback), so the actual value here doesn't
-        // matter - it just needs to be non-null/non-empty so the static
-        // initializer doesn't crash. java.io.tmpdir is always set on Android.
-        if (System.getProperty("user.home") == null || System.getProperty("user.home").isEmpty()) {
-            System.setProperty("user.home", System.getProperty("java.io.tmpdir", "/data/local/tmp"));
-        }
-    }
-
-    private JGitKeyCache keyCache;
-
-    @Override
-    protected void handleOnDestroy() {
-        if (keyCache != null) {
-            keyCache.close();
-        }
-    }
 
     // ---- Secure key storage (Keystore-backed, per-app-sandboxed) -----------
 
@@ -165,11 +144,8 @@ public class GitSyncPlugin extends Plugin {
             call.reject("remoteUrl is required");
             return;
         }
-        File sshDir = null;
         try {
-            SshKeyMaterial key = loadKeyMaterial();
-            sshDir = key.sshDir;
-            TransportConfigCallback cb = buildTransportConfigCallback(key);
+            TransportConfigCallback cb = buildTransportConfigCallback(loadKeyMaterial());
             Collection<Ref> refs = Git.lsRemoteRepository()
                     .setRemote(remoteUrl)
                     .setTransportConfigCallback(cb)
@@ -181,8 +157,6 @@ public class GitSyncPlugin extends Plugin {
         } catch (Exception e) {
             Log.e(TAG, "testConnection failed", e);
             call.reject("Connection failed: " + e.getMessage());
-        } finally {
-            cleanupSshDir(sshDir);
         }
     }
 
@@ -194,11 +168,8 @@ public class GitSyncPlugin extends Plugin {
             call.reject("repoDir and remoteUrl are required");
             return;
         }
-        File sshDir = null;
         try (Git git = openOrInitRepo(repoDir, remoteUrl)) {
-            SshKeyMaterial key = loadKeyMaterial();
-            sshDir = key.sshDir;
-            TransportConfigCallback cb = buildTransportConfigCallback(key);
+            TransportConfigCallback cb = buildTransportConfigCallback(loadKeyMaterial());
 
             boolean hadCommitBefore = git.getRepository().resolve("HEAD") != null;
 
@@ -236,8 +207,6 @@ public class GitSyncPlugin extends Plugin {
         } catch (Exception e) {
             Log.e(TAG, "pull failed", e);
             call.reject("Pull failed: " + e.getMessage());
-        } finally {
-            cleanupSshDir(sshDir);
         }
     }
 
@@ -249,11 +218,8 @@ public class GitSyncPlugin extends Plugin {
             call.reject("repoDir and remoteUrl are required");
             return;
         }
-        File sshDir = null;
         try (Git git = openOrInitRepo(repoDir, remoteUrl)) {
-            SshKeyMaterial key = loadKeyMaterial();
-            sshDir = key.sshDir;
-            TransportConfigCallback cb = buildTransportConfigCallback(key);
+            TransportConfigCallback cb = buildTransportConfigCallback(loadKeyMaterial());
 
             // `git add -A` equivalent: stage new/modified, then stage deletions.
             git.add().addFilepattern(".").call();
@@ -297,8 +263,6 @@ public class GitSyncPlugin extends Plugin {
         } catch (Exception e) {
             Log.e(TAG, "commitAndPush failed", e);
             call.reject("Sync failed: " + e.getMessage());
-        } finally {
-            cleanupSshDir(sshDir);
         }
     }
 
@@ -375,57 +339,8 @@ public class GitSyncPlugin extends Plugin {
     }
 
     private static class SshKeyMaterial {
-        File sshDir;
-        Path keyPath;
-        char[] passphrase;
-    }
-
-    /**
-     * Trust-on-first-use host key verification: the first time we connect to
-     * a host, its key is accepted and remembered in a persistent file (NOT
-     * the per-call ephemeral ssh dir, which is wiped after every operation).
-     * On later connections, the presented key must match what's stored, or
-     * the connection is rejected (protects against a key change after first
-     * trust, e.g. MITM). Without this, JGit's default "ask" policy has no
-     * interactive prompt to fall back on and just rejects every unknown host
-     * key outright, which surfaces as "Server key did not validate" /
-     * "Remote hung up unexpectedly".
-     */
-    private static class TrustOnFirstUseServerKeyDatabase implements ServerKeyDatabase {
-        private final File trustedHostsFile;
-
-        TrustOnFirstUseServerKeyDatabase(File trustedHostsFile) {
-            this.trustedHostsFile = trustedHostsFile;
-        }
-
-        @Override
-        public List<PublicKey> lookup(String connectAddress, InetSocketAddress remoteAddress, Configuration config) {
-            return Collections.emptyList();
-        }
-
-        @Override
-        public synchronized boolean accept(String connectAddress, InetSocketAddress remoteAddress, PublicKey serverKey,
-                                            Configuration config, CredentialsProvider provider) {
-            try {
-                String encoded = Base64.getEncoder().encodeToString(serverKey.getEncoded());
-                List<String> lines = trustedHostsFile.exists()
-                        ? Files.readAllLines(trustedHostsFile.toPath(), StandardCharsets.UTF_8)
-                        : new ArrayList<>();
-                for (String line : lines) {
-                    int sp = line.indexOf(' ');
-                    if (sp > 0 && line.substring(0, sp).equals(connectAddress)) {
-                        return line.substring(sp + 1).equals(encoded);
-                    }
-                }
-                try (FileWriter fw = new FileWriter(trustedHostsFile, true)) {
-                    fw.write(connectAddress + " " + encoded + "\n");
-                }
-                return true;
-            } catch (Exception e) {
-                Log.e(TAG, "Host key trust check failed for " + connectAddress, e);
-                return false;
-            }
-        }
+        byte[] privateKeyBytes;
+        byte[] passphraseBytes;
     }
 
     private SshKeyMaterial loadKeyMaterial() throws Exception {
@@ -435,63 +350,39 @@ public class GitSyncPlugin extends Plugin {
         if (privateKey == null) {
             throw new IllegalStateException("No SSH private key configured");
         }
-
-        File sshDir = new File(getContext().getFilesDir(), "git-ssh-" + System.nanoTime());
-        sshDir.mkdirs();
-        File keyFile = new File(sshDir, "id_key");
-        try (FileOutputStream fos = new FileOutputStream(keyFile)) {
-            fos.write(privateKey.getBytes(StandardCharsets.UTF_8));
-        }
-        // best-effort 600 perms: owner read/write only
-        keyFile.setReadable(false, false);
-        keyFile.setReadable(true, true);
-        keyFile.setWritable(false, false);
-        keyFile.setWritable(true, true);
-
         SshKeyMaterial material = new SshKeyMaterial();
-        material.sshDir = sshDir;
-        material.keyPath = keyFile.toPath();
-        material.passphrase = passphrase.isEmpty() ? new char[0] : passphrase.toCharArray();
+        material.privateKeyBytes = privateKey.getBytes(StandardCharsets.UTF_8);
+        material.passphraseBytes = passphrase.isEmpty() ? null : passphrase.getBytes(StandardCharsets.UTF_8);
         return material;
     }
 
     /**
-     * Builds SSH transport config pointed at an in-memory-supplied key file
-     * (via {@link SshdSessionFactoryBuilder#setDefaultIdentities}), rather than
-     * relying on filename conventions under ~/.ssh.
+     * Builds SSH transport config using JGit's JSch-based session factory,
+     * with the private key supplied directly as in-memory bytes (JSch's
+     * {@code addIdentity(name, prvkey, pubkey, passphrase)} overload) rather
+     * than via any file on disk.
      */
     private TransportConfigCallback buildTransportConfigCallback(SshKeyMaterial key) {
-        if (keyCache == null) {
-            keyCache = new JGitKeyCache();
-        }
-        Path keyPath = key.keyPath;
-        char[] passphrase = key.passphrase;
-
         File trustedHostsFile = new File(getContext().getFilesDir(), TRUSTED_HOSTS_FILE);
 
-        SshdSessionFactory sessionFactory = new SshdSessionFactoryBuilder()
-                .setPreferredAuthentications("publickey")
-                .setHomeDirectory(key.sshDir)
-                .setSshDirectory(key.sshDir)
-                .setDefaultIdentities(dir -> Collections.singletonList(keyPath))
-                .setServerKeyDatabase((home, ssh) -> new TrustOnFirstUseServerKeyDatabase(trustedHostsFile))
-                .setKeyPasswordProvider(cp -> new KeyPasswordProvider() {
-                    @Override
-                    public char[] getPassphrase(URIish uri, int attempt) {
-                        return passphrase.length == 0 ? null : passphrase;
-                    }
+        SshSessionFactory sessionFactory = new JschConfigSessionFactory() {
+            @Override
+            protected void configure(OpenSshConfig.Host hc, Session session) {
+                // TrustOnFirstUseHostKeyRepository.check() below is the actual
+                // enforcement point; "yes" just means "only OK from check()
+                // is accepted", which is what we want.
+                session.setConfig("StrictHostKeyChecking", "yes");
+                session.setConfig("PreferredAuthentications", "publickey");
+            }
 
-                    @Override
-                    public void setAttempts(int maxNumberOfAttempts) {
-                        // no-op: passphrase is fixed for the lifetime of this call
-                    }
-
-                    @Override
-                    public boolean keyLoaded(URIish uri, int attempt, Exception error) {
-                        return false; // do not retry/prompt
-                    }
-                })
-                .build(keyCache);
+            @Override
+            protected JSch createDefaultJSch(FS fs) throws JSchException {
+                JSch jsch = new JSch();
+                jsch.setHostKeyRepository(new TrustOnFirstUseHostKeyRepository(trustedHostsFile));
+                jsch.addIdentity("git-sync-key", key.privateKeyBytes, null, key.passphraseBytes);
+                return jsch;
+            }
+        };
 
         return transport -> {
             if (transport instanceof SshTransport) {
@@ -500,20 +391,73 @@ public class GitSyncPlugin extends Plugin {
         };
     }
 
-    private void cleanupSshDir(File sshDir) {
-        if (sshDir == null) {
-            return;
+    /**
+     * Trust-on-first-use host key verification: the first time we connect to
+     * a host, its key is accepted and remembered in a persistent file. On
+     * later connections, the presented key must match what's stored, or the
+     * connection is rejected (protects against a key change after first
+     * trust, e.g. MITM). All the trust logic lives in {@link #check}, which
+     * returns only OK/CHANGED - never relies on JSch's own NOT_INCLUDED
+     * handling, since that behaves inconsistently across JSch versions when
+     * no interactive UserInfo prompt is available (as here, headless).
+     */
+    private static class TrustOnFirstUseHostKeyRepository implements HostKeyRepository {
+        private final File trustedHostsFile;
+
+        TrustOnFirstUseHostKeyRepository(File trustedHostsFile) {
+            this.trustedHostsFile = trustedHostsFile;
         }
-        try {
-            File[] files = sshDir.listFiles();
-            if (files != null) {
-                for (File f : files) {
-                    f.delete();
+
+        @Override
+        public synchronized int check(String host, byte[] key) {
+            try {
+                String encoded = Base64.getEncoder().encodeToString(key);
+                List<String> lines = trustedHostsFile.exists()
+                        ? Files.readAllLines(trustedHostsFile.toPath(), StandardCharsets.UTF_8)
+                        : new ArrayList<>();
+                for (String line : lines) {
+                    int sp = line.indexOf(' ');
+                    if (sp > 0 && line.substring(0, sp).equals(host)) {
+                        return line.substring(sp + 1).equals(encoded) ? OK : CHANGED;
+                    }
                 }
+                // first time seeing this host: trust and remember
+                try (FileWriter fw = new FileWriter(trustedHostsFile, true)) {
+                    fw.write(host + " " + encoded + "\n");
+                }
+                return OK;
+            } catch (Exception e) {
+                Log.e(TAG, "Host key trust check failed for " + host, e);
+                return NOT_INCLUDED;
             }
-            sshDir.delete();
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to clean up temp ssh dir", e);
+        }
+
+        @Override
+        public void add(HostKey hostkey, UserInfo ui) {
+            // no-op: persistence already handled in check()
+        }
+
+        @Override
+        public void remove(String host, String type) {
+        }
+
+        @Override
+        public void remove(String host, String type, byte[] key) {
+        }
+
+        @Override
+        public String getKnownHostsRepositoryID() {
+            return null;
+        }
+
+        @Override
+        public HostKey[] getHostKey() {
+            return new HostKey[0];
+        }
+
+        @Override
+        public HostKey[] getHostKey(String host, String type) {
+            return new HostKey[0];
         }
     }
 }
