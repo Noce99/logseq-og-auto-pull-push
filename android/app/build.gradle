@@ -71,7 +71,15 @@ dependencies {
     // MINA sshd) - MINA sshd hard-crashes on Android in two different ways
     // (see the class doc on GitSyncPlugin), JSch doesn't have that baggage.
     implementation 'org.eclipse.jgit:org.eclipse.jgit:6.10.0.202406032230-r'
-    implementation 'org.eclipse.jgit:org.eclipse.jgit.ssh.jsch:6.10.0.202406032230-r'
+    implementation('org.eclipse.jgit:org.eclipse.jgit.ssh.jsch:6.10.0.202406032230-r') {
+        // The official com.jcraft:jsch (last released 2018) has no Ed25519
+        // support at all, which is the default key type modern ssh-keygen
+        // produces - confirmed on-device via logcat: JSchException: invalid
+        // privatekey. Swap in the actively-maintained fork, same package
+        // (com.jcraft.jsch), drop-in compatible, adds Ed25519/RSA-SHA2/etc.
+        exclude group: 'com.jcraft', module: 'jsch'
+    }
+    implementation 'com.github.mwiede:jsch:0.2.25'
     implementation 'androidx.security:security-crypto:1.1.0-alpha06'
 }
 
