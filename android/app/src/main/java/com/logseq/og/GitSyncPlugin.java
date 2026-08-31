@@ -28,9 +28,14 @@ import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.TransportConfigCallback;
 import org.eclipse.jgit.api.errors.CheckoutConflictException;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.ObjectLoader;
+import org.eclipse.jgit.lib.ObjectReader;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.PushResult;
 import org.eclipse.jgit.transport.RemoteConfig;
 import org.eclipse.jgit.transport.RemoteRefUpdate;
@@ -39,17 +44,22 @@ import org.eclipse.jgit.transport.SshTransport;
 import org.eclipse.jgit.transport.URIish;
 import org.eclipse.jgit.transport.ssh.jsch.JschConfigSessionFactory;
 import org.eclipse.jgit.transport.ssh.jsch.OpenSshConfig;
+import org.eclipse.jgit.treewalk.TreeWalk;
 import org.eclipse.jgit.util.FS;
 
 import java.io.File;
 import java.io.FileWriter;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Keeps the currently-open graph folder in sync with a remote git repo over
@@ -199,27 +209,35 @@ public class GitSyncPlugin extends Plugin {
                     String localBranchName = slash >= 0 ? shortName.substring(slash + 1) : shortName;
 
                     // setForce(true): idempotent against a previous cold-start
-                    // attempt that created this branch but then failed at
-                    // checkout (e.g. MERGE_CONFLICT) before HEAD ever became
-                    // "born" - confirmed on-device: RefAlreadyExistsException
-                    // on retry without this.
+                    // attempt that created this branch but then failed before
+                    // HEAD ever became "born" - confirmed on-device:
+                    // RefAlreadyExistsException on retry without this.
                     git.branchCreate()
                             .setName(localBranchName)
                             .setStartPoint(remoteHead.getName())
                             .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.TRACK)
                             .setForce(true)
                             .call();
-                    // Actually check the branch out (not just a MIXED reset,
-                    // which only moves HEAD/index bookkeeping and never
-                    // writes remote file content into the working directory -
-                    // confirmed on-device: pull "succeeded" but no files
-                    // appeared). A real checkout writes any file present in
-                    // the remote commit but missing locally, and throws
-                    // CheckoutConflictException (already handled below) if a
-                    // pre-existing local file would be overwritten with
-                    // different content - so this still can't silently clobber
-                    // the user's existing graph.
-                    git.checkout().setName(localBranchName).call();
+
+                    // Materialize the remote's files ourselves (scan fully for
+                    // conflicts BEFORE writing anything) instead of using
+                    // git.checkout(), which turned out to NOT be atomic on
+                    // conflict: confirmed on-device it can delete/overwrite
+                    // unrelated working-tree files before throwing on the
+                    // file that actually conflicts. See materializeColdStart.
+                    RevCommit remoteCommit;
+                    try (RevWalk revWalk = new RevWalk(git.getRepository())) {
+                        remoteCommit = revWalk.parseCommit(remoteHead.getObjectId());
+                    }
+                    materializeColdStart(git.getRepository(), remoteCommit, git.getRepository().getWorkTree());
+
+                    String localRef = "refs/heads/" + localBranchName;
+                    git.getRepository().updateRef("HEAD").link(localRef);
+                    // Working tree now matches the remote commit exactly
+                    // (pre-existing-and-identical files untouched, missing
+                    // ones just written) - a MIXED reset only needs to update
+                    // index/HEAD bookkeeping to match, no more file writes.
+                    git.reset().setMode(ResetCommand.ResetType.MIXED).setRef(localRef).call();
                 }
                 resolveOk(call, false);
                 return;
@@ -236,7 +254,7 @@ public class GitSyncPlugin extends Plugin {
                 return;
             }
             resolveOk(call, true);
-        } catch (CheckoutConflictException e) {
+        } catch (CheckoutConflictException | ColdStartConflictException e) {
             call.reject("Local changes conflict with remote", "MERGE_CONFLICT");
         } catch (Exception e) {
             Log.e(TAG, "pull failed", e);
@@ -329,6 +347,61 @@ public class GitSyncPlugin extends Plugin {
             git.reset().setMode(ResetCommand.ResetType.HARD).setRef("ORIG_HEAD").call();
         } catch (Exception e) {
             Log.e(TAG, "Failed to abort conflicted merge", e);
+        }
+    }
+
+    private static class ColdStartConflictException extends Exception {
+        ColdStartConflictException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Safely brings the working directory in line with {@code remoteCommit}'s
+     * tree, for the case where there's no local commit yet but there may be
+     * pre-existing, untracked local files: scans the ENTIRE remote tree
+     * first, comparing every path against the working directory - a path
+     * that exists locally with different content is a conflict. Nothing is
+     * written to disk unless the full scan finds zero conflicts, so unlike
+     * git.checkout() (confirmed on-device to delete/overwrite files before
+     * throwing on the one that actually conflicts) this can never partially
+     * apply.
+     */
+    private void materializeColdStart(Repository repo, RevCommit remoteCommit, File workDir)
+            throws IOException, ColdStartConflictException {
+        List<String> conflicts = new ArrayList<>();
+        Map<String, ObjectId> toWrite = new LinkedHashMap<>();
+
+        try (TreeWalk treeWalk = new TreeWalk(repo);
+             ObjectReader reader = repo.newObjectReader()) {
+            treeWalk.addTree(remoteCommit.getTree());
+            treeWalk.setRecursive(true);
+            while (treeWalk.next()) {
+                String path = treeWalk.getPathString();
+                File localFile = new File(workDir, path);
+                if (!localFile.isFile()) {
+                    toWrite.put(path, treeWalk.getObjectId(0));
+                    continue;
+                }
+                ObjectLoader loader = reader.open(treeWalk.getObjectId(0));
+                if (!Arrays.equals(loader.getBytes(), Files.readAllBytes(localFile.toPath()))) {
+                    conflicts.add(path);
+                }
+            }
+
+            if (!conflicts.isEmpty()) {
+                throw new ColdStartConflictException(
+                        conflicts.size() + " local file(s) differ from remote: " + conflicts);
+            }
+
+            for (Map.Entry<String, ObjectId> entry : toWrite.entrySet()) {
+                File target = new File(workDir, entry.getKey());
+                File parent = target.getParentFile();
+                if (parent != null) {
+                    parent.mkdirs();
+                }
+                Files.write(target.toPath(), reader.open(entry.getValue()).getBytes());
+            }
         }
     }
 
