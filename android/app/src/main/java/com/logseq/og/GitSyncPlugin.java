@@ -30,6 +30,7 @@ import org.eclipse.jgit.api.errors.CheckoutConflictException;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.PushResult;
 import org.eclipse.jgit.transport.RemoteConfig;
 import org.eclipse.jgit.transport.RemoteRefUpdate;
@@ -37,14 +38,21 @@ import org.eclipse.jgit.transport.SshTransport;
 import org.eclipse.jgit.transport.URIish;
 import org.eclipse.jgit.transport.sshd.JGitKeyCache;
 import org.eclipse.jgit.transport.sshd.KeyPasswordProvider;
+import org.eclipse.jgit.transport.sshd.ServerKeyDatabase;
 import org.eclipse.jgit.transport.sshd.SshdSessionFactory;
 import org.eclipse.jgit.transport.sshd.SshdSessionFactoryBuilder;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileWriter;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.PublicKey;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -63,6 +71,7 @@ public class GitSyncPlugin extends Plugin {
     private static final String PREFS_NAME = "git_sync_secure_prefs";
     private static final String KEY_PRIVATE_KEY = "private_key";
     private static final String KEY_PASSPHRASE = "passphrase";
+    private static final String TRUSTED_HOSTS_FILE = "git_sync_trusted_hosts";
 
     private JGitKeyCache keyCache;
 
@@ -356,6 +365,54 @@ public class GitSyncPlugin extends Plugin {
         char[] passphrase;
     }
 
+    /**
+     * Trust-on-first-use host key verification: the first time we connect to
+     * a host, its key is accepted and remembered in a persistent file (NOT
+     * the per-call ephemeral ssh dir, which is wiped after every operation).
+     * On later connections, the presented key must match what's stored, or
+     * the connection is rejected (protects against a key change after first
+     * trust, e.g. MITM). Without this, JGit's default "ask" policy has no
+     * interactive prompt to fall back on and just rejects every unknown host
+     * key outright, which surfaces as "Server key did not validate" /
+     * "Remote hung up unexpectedly".
+     */
+    private static class TrustOnFirstUseServerKeyDatabase implements ServerKeyDatabase {
+        private final File trustedHostsFile;
+
+        TrustOnFirstUseServerKeyDatabase(File trustedHostsFile) {
+            this.trustedHostsFile = trustedHostsFile;
+        }
+
+        @Override
+        public List<PublicKey> lookup(String connectAddress, InetSocketAddress remoteAddress, Configuration config) {
+            return Collections.emptyList();
+        }
+
+        @Override
+        public synchronized boolean accept(String connectAddress, InetSocketAddress remoteAddress, PublicKey serverKey,
+                                            Configuration config, CredentialsProvider provider) {
+            try {
+                String encoded = Base64.getEncoder().encodeToString(serverKey.getEncoded());
+                List<String> lines = trustedHostsFile.exists()
+                        ? Files.readAllLines(trustedHostsFile.toPath(), StandardCharsets.UTF_8)
+                        : new ArrayList<>();
+                for (String line : lines) {
+                    int sp = line.indexOf(' ');
+                    if (sp > 0 && line.substring(0, sp).equals(connectAddress)) {
+                        return line.substring(sp + 1).equals(encoded);
+                    }
+                }
+                try (FileWriter fw = new FileWriter(trustedHostsFile, true)) {
+                    fw.write(connectAddress + " " + encoded + "\n");
+                }
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "Host key trust check failed for " + connectAddress, e);
+                return false;
+            }
+        }
+    }
+
     private SshKeyMaterial loadKeyMaterial() throws Exception {
         SharedPreferences prefs = securePrefs();
         String privateKey = prefs.getString(KEY_PRIVATE_KEY, null);
@@ -395,11 +452,14 @@ public class GitSyncPlugin extends Plugin {
         Path keyPath = key.keyPath;
         char[] passphrase = key.passphrase;
 
+        File trustedHostsFile = new File(getContext().getFilesDir(), TRUSTED_HOSTS_FILE);
+
         SshdSessionFactory sessionFactory = new SshdSessionFactoryBuilder()
                 .setPreferredAuthentications("publickey")
                 .setHomeDirectory(key.sshDir)
                 .setSshDirectory(key.sshDir)
                 .setDefaultIdentities(dir -> Collections.singletonList(keyPath))
+                .setServerKeyDatabase((home, ssh) -> new TrustOnFirstUseServerKeyDatabase(trustedHostsFile))
                 .setKeyPasswordProvider(cp -> new KeyPasswordProvider() {
                     @Override
                     public char[] getPassphrase(URIish uri, int attempt) {
