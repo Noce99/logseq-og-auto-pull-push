@@ -407,7 +407,7 @@ public class GitSyncPlugin extends Plugin {
                     }
 
                     @Override
-                    public void setPassphrase(URIish uri, char[] newPassphrase) {
+                    public void setAttempts(int maxNumberOfAttempts) {
                         // no-op: passphrase is fixed for the lifetime of this call
                     }
 

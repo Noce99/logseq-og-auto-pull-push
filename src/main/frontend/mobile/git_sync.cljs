@@ -42,7 +42,7 @@
 (defn has-private-key?
   []
   (p/let [ret (.hasPrivateKey git-sync)]
-    (.-hasKey ret)))
+    (.-hasKey ^js ret)))
 
 (defn clear-private-key!
   []
