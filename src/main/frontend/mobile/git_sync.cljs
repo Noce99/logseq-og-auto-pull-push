@@ -14,9 +14,14 @@
             [frontend.state :as state]
             [promesa.core :as p]))
 
-(defonce git-sync
-  (when (mobile-util/native-android?)
-    (registerPlugin "GitSync")))
+;; NOTE: the `when` must wrap the whole `defonce`, not just the registerPlugin
+;; call - `(defonce x (when test (registerPlugin ...)))` compiles to a ternary
+;; and loses the type info :infer-externs needs to protect the plugin's method
+;; names from advanced-mode renaming (they'd get minified and every call would
+;; fail at runtime with "GitSync.<mangled-name>() is not implemented"). The
+;; explicit ^js tag is a second, belt-and-suspenders safeguard.
+(when (mobile-util/native-android?)
+  (defonce ^js git-sync (registerPlugin "GitSync")))
 
 (defonce ^:private *auto-push-interval-id (atom nil))
 (defonce ^:private *syncing? (atom false))
