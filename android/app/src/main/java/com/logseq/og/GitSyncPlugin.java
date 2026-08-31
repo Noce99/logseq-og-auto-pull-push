@@ -198,10 +198,16 @@ public class GitSyncPlugin extends Plugin {
                     int slash = shortName.indexOf('/');
                     String localBranchName = slash >= 0 ? shortName.substring(slash + 1) : shortName;
 
+                    // setForce(true): idempotent against a previous cold-start
+                    // attempt that created this branch but then failed at
+                    // checkout (e.g. MERGE_CONFLICT) before HEAD ever became
+                    // "born" - confirmed on-device: RefAlreadyExistsException
+                    // on retry without this.
                     git.branchCreate()
                             .setName(localBranchName)
                             .setStartPoint(remoteHead.getName())
                             .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.TRACK)
+                            .setForce(true)
                             .call();
                     // Actually check the branch out (not just a MIXED reset,
                     // which only moves HEAD/index bookkeeping and never
