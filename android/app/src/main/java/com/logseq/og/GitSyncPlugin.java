@@ -203,13 +203,17 @@ public class GitSyncPlugin extends Plugin {
                             .setStartPoint(remoteHead.getName())
                             .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.TRACK)
                             .call();
-                    String localRef = "refs/heads/" + localBranchName;
-                    git.getRepository().updateRef("HEAD").link(localRef);
-                    // Update HEAD/index to the new commit WITHOUT touching
-                    // working-tree files, so any pre-existing local graph
-                    // files stay intact as uncommitted changes to be picked
-                    // up by the next commitAndPush.
-                    git.reset().setMode(ResetCommand.ResetType.MIXED).setRef(localRef).call();
+                    // Actually check the branch out (not just a MIXED reset,
+                    // which only moves HEAD/index bookkeeping and never
+                    // writes remote file content into the working directory -
+                    // confirmed on-device: pull "succeeded" but no files
+                    // appeared). A real checkout writes any file present in
+                    // the remote commit but missing locally, and throws
+                    // CheckoutConflictException (already handled below) if a
+                    // pre-existing local file would be overwritten with
+                    // different content - so this still can't silently clobber
+                    // the user's existing graph.
+                    git.checkout().setName(localBranchName).call();
                 }
                 resolveOk(call, false);
                 return;
