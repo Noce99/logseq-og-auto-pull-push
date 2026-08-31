@@ -829,7 +829,7 @@
        (ui/button
         (t :settings-page/git-sync-save-key)
         :class "text-sm"
-        :disabled (string/blank? @*private-key)
+        :disabled? (string/blank? @*private-key)
         :on-click
         (fn []
           (p/let [_ (git-sync/save-private-key! @*private-key @*passphrase)]
