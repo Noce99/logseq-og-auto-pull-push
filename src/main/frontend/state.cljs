@@ -192,6 +192,10 @@
      :mobile/show-toolbar?                  false
      :mobile/show-recording-bar?            false
      :mobile/show-tabbar?                   false
+     ;; Android git remote sync (device-local, not synced with the graph)
+     ;; {:enabled? bool :remote-url string :interval-seconds int
+     ;;  :pull-on-startup? bool :status keyword :last-synced-at int :last-error string}
+     :mobile/git-sync-cfgs                  (or (storage/get :mobile/git-sync-cfgs) {})
      ;;; Used to monitor mobile app status,
      ;;; value spec:
      ;;; {:is-active? bool, :timestamp int}
@@ -1938,6 +1942,35 @@ Similar to re-frame subscriptions"
 (defn get-git-commit-on-close-enabled?
   []
   (sub [:electron/user-cfgs :git/commit-on-close?]))
+
+(defn get-mobile-git-sync-cfgs
+  []
+  (sub :mobile/git-sync-cfgs))
+
+(defn set-mobile-git-sync-cfgs!
+  "Merges `m` into the device-local Android git-sync config and persists it.
+  Never store the SSH private key/passphrase here - those live only in the
+  native GitSync plugin's encrypted storage."
+  [m]
+  (let [cfgs (merge (get-mobile-git-sync-cfgs) m)]
+    (set-state! :mobile/git-sync-cfgs cfgs)
+    (storage/set :mobile/git-sync-cfgs cfgs)))
+
+(defn get-mobile-git-sync-enabled?
+  []
+  (boolean (:enabled? (get-mobile-git-sync-cfgs))))
+
+(defn get-mobile-git-sync-remote-url
+  []
+  (:remote-url (get-mobile-git-sync-cfgs)))
+
+(defn get-mobile-git-sync-interval-seconds
+  []
+  (or (:interval-seconds (get-mobile-git-sync-cfgs)) 60))
+
+(defn get-mobile-git-sync-pull-on-startup?
+  []
+  (boolean (:pull-on-startup? (get-mobile-git-sync-cfgs))))
 
 (defn set-last-key-code!
   [key-code]
