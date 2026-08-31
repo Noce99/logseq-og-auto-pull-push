@@ -21,6 +21,7 @@
             [frontend.handler.route :as route-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.mobile.git-sync :as git-sync]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.core :as instrument]
             [frontend.modules.shortcut.data-helper :as shortcut-helper]
@@ -778,6 +779,185 @@
    (switch-git-commit-on-close-row t)
    (git-auto-commit-seconds t)])
 
+(rum/defc git-sync-remote-url-row < rum/reactive
+  []
+  (let [remote-url (or (state/get-mobile-git-sync-remote-url) "")]
+    [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+     [:label.block.text-sm.font-medium.leading-5.opacity-70
+      (t :settings-page/git-sync-remote-url)]
+     [:div.mt-1.sm:mt-0.sm:col-span-2
+      [:input.form-input.is-small.transition.duration-150.ease-in-out
+       {:default-value remote-url
+        :placeholder   (t :settings-page/git-sync-remote-url-placeholder)
+        :on-blur       (fn [event]
+                         (state/set-mobile-git-sync-cfgs! {:remote-url (string/trim (util/evalue event))}))}]]]))
+
+(rum/defcs git-sync-key-row
+  < (rum/local "" ::private-key)
+    (rum/local "" ::passphrase)
+    (rum/local :unknown ::key-status)
+    {:did-mount
+     (fn [state]
+       (p/let [has? (git-sync/has-private-key?)]
+         (reset! (::key-status state) (if has? :saved :missing)))
+       state)}
+  [state]
+  (let [*private-key (::private-key state)
+        *passphrase  (::passphrase state)
+        *key-status  (::key-status state)]
+    [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-start
+     [:label.block.text-sm.font-medium.leading-5.opacity-70
+      (t :settings-page/git-sync-private-key)]
+     [:div.mt-1.sm:mt-0.sm:col-span-2.flex.flex-col
+      {:style {:gap "0.5rem"}}
+      [:div.text-sm.opacity-70
+       (case @*key-status
+         :saved   (t :settings-page/git-sync-key-saved)
+         :missing (t :settings-page/git-sync-no-key)
+         "")]
+      [:textarea.form-input.is-small
+       {:rows        4
+        :placeholder (t :settings-page/git-sync-private-key-placeholder)
+        :value       @*private-key
+        :on-change   #(reset! *private-key (util/evalue %))}]
+      [:input.form-input.is-small
+       {:type        "password"
+        :placeholder (t :settings-page/git-sync-passphrase)
+        :value       @*passphrase
+        :on-change   #(reset! *passphrase (util/evalue %))}]
+      [:div.flex {:style {:gap "0.5rem"}}
+       (ui/button
+        (t :settings-page/git-sync-save-key)
+        :class "text-sm"
+        :disabled (string/blank? @*private-key)
+        :on-click
+        (fn []
+          (p/let [_ (git-sync/save-private-key! @*private-key @*passphrase)]
+            (reset! *private-key "")
+            (reset! *passphrase "")
+            (reset! *key-status :saved)
+            (notification/show! (t :settings-page/git-sync-key-saved) :success))))
+       (ui/button
+        (t :settings-page/git-sync-clear-key)
+        :class "text-sm"
+        :on-click
+        (fn []
+          (p/let [_ (git-sync/clear-private-key!)]
+            (reset! *key-status :missing))))]]]))
+
+(rum/defc git-sync-test-connection-row
+  []
+  [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+   [:label.block.text-sm.font-medium.leading-5.opacity-70 ""]
+   [:div.mt-1.sm:mt-0.sm:col-span-2
+    (ui/button
+     (t :settings-page/git-sync-test-connection)
+     :class "text-sm"
+     :on-click
+     (fn []
+       (let [remote-url (state/get-mobile-git-sync-remote-url)]
+         (-> (git-sync/test-connection! remote-url)
+             (p/then (fn [_] (notification/show! (t :settings-page/git-sync-connection-ok) :success)))
+             (p/catch (fn [^js error]
+                        (notification/show!
+                         (str (t :settings-page/git-sync-connection-failed) ": " (.-message error))
+                         :error)))))))]])
+
+(rum/defc git-sync-pull-on-startup-row < rum/reactive
+  []
+  (let [enabled? (state/get-mobile-git-sync-pull-on-startup?)]
+    [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+     [:label.block.text-sm.font-medium.leading-5.opacity-70
+      (t :settings-page/git-sync-pull-on-startup)]
+     [:div
+      [:div.rounded-md.sm:max-w-xs
+       (ui/toggle
+        enabled?
+        (fn [] (state/set-mobile-git-sync-cfgs! {:pull-on-startup? (not enabled?)}))
+        true)]]]))
+
+(rum/defc git-sync-enable-auto-push-row < rum/reactive
+  []
+  (let [enabled? (state/get-mobile-git-sync-enabled?)]
+    [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+     [:label.block.text-sm.font-medium.leading-5.opacity-70
+      (t :settings-page/git-sync-enable-auto-push)]
+     [:div
+      [:div.rounded-md.sm:max-w-xs
+       (ui/toggle
+        enabled?
+        (fn []
+          (let [value (not enabled?)]
+            (state/set-mobile-git-sync-cfgs! {:enabled? value})
+            (if value
+              (git-sync/start-auto-push-timer!)
+              (git-sync/stop-auto-push-timer!))))
+        true)]]]))
+
+(rum/defc git-sync-interval-seconds-row < rum/reactive
+  []
+  (let [secs (state/get-mobile-git-sync-interval-seconds)]
+    [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+     [:label.block.text-sm.font-medium.leading-5.opacity-70
+      (t :settings-page/git-sync-interval-seconds)]
+     [:div.mt-1.sm:mt-0.sm:col-span-2
+      [:div.max-w-lg.rounded-md.sm:max-w-xs
+       [:input.form-input.is-small.transition.duration-150.ease-in-out
+        {:default-value secs
+         :on-blur       (fn [event]
+                          (let [value (-> (util/evalue event) util/safe-parse-int)]
+                            (if (and (number? value) (< 0 value (inc 86400)))
+                              (do
+                                (state/set-mobile-git-sync-cfgs! {:interval-seconds value})
+                                (when (state/get-mobile-git-sync-enabled?)
+                                  (git-sync/start-auto-push-timer!)))
+                              (do
+                                (notification/show!
+                                 [:div "Invalid value! Must be a number between 1 and 86400"]
+                                 :warning true)
+                                (when-let [elem (gobj/get event "target")]
+                                  (gobj/set elem "value" secs))))))}]]]]))
+
+(rum/defc git-sync-now-row
+  []
+  [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+   [:label.block.text-sm.font-medium.leading-5.opacity-70 ""]
+   [:div.mt-1.sm:mt-0.sm:col-span-2
+    (ui/button
+     (t :settings-page/git-sync-now)
+     :class "text-sm"
+     :on-click (fn [] (git-sync/sync-now!)))]])
+
+(rum/defc git-sync-status-row < rum/reactive
+  []
+  (let [{:keys [status last-synced-at last-error]} (state/get-mobile-git-sync-cfgs)]
+    (when (or status last-synced-at last-error)
+      [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+       [:label.block.text-sm.font-medium.leading-5.opacity-70 ""]
+       [:div.mt-1.sm:mt-0.sm:col-span-2.text-sm.opacity-70
+        (case status
+          :conflict (t :settings-page/git-sync-status-conflict)
+          :error    (str (t :settings-page/git-sync-status-error) ": " last-error)
+          (when last-synced-at
+            (str (t :settings-page/git-sync-status-ok) ": " (.toLocaleString (js/Date. last-synced-at)))))]])))
+
+(rum/defc settings-git-sync
+  []
+  [:div.panel-wrap
+   [:div.text-sm.my-4
+    (ui/admonition
+     :tip
+     [:p (t :settings-page/git-sync-tip)])]
+   [:br]
+   (git-sync-remote-url-row)
+   (git-sync-key-row)
+   (git-sync-test-connection-row)
+   (git-sync-pull-on-startup-row)
+   (git-sync-enable-auto-push-row)
+   (git-sync-interval-seconds-row)
+   (git-sync-now-row)
+   (git-sync-status-row)])
+
 (rum/defc settings-advanced < rum/reactive
   [current-repo]
   (let [instrument-disabled? (state/sub :instrument/disabled?)
@@ -1166,6 +1346,9 @@
                (when (util/electron?)
                  [:version-control "git" (t :settings-page/tab-version-control) (ui/icon "history")])
 
+               (when (mobile-util/native-android?)
+                 [:git-sync "git-sync" (t :settings-page/tab-git-sync) (ui/icon "history")])
+
                ;; (when (util/electron?)
                ;;   [:assets "assets" (t :settings-page/tab-assets) (ui/icon "box")])
 
@@ -1210,6 +1393,9 @@
 
          :version-control
          (settings-git)
+
+         :git-sync
+         (settings-git-sync)
 
          :assets
          (assets/settings-content)

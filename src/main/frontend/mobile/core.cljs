@@ -7,6 +7,7 @@
             [frontend.fs.capacitor-fs :as capacitor-fs]
             [frontend.handler.editor :as editor-handler]
             [frontend.mobile.deeplink :as deeplink]
+            [frontend.mobile.git-sync :as git-sync]
             [frontend.mobile.intent :as intent]
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
@@ -36,7 +37,13 @@
   (when (mobile-util/native-ios?)
     (when @*init-url
       (deeplink/deeplink @*init-url)
-      (reset! *init-url nil))))
+      (reset! *init-url nil)))
+
+  (when (mobile-util/native-android?)
+    (when (state/get-mobile-git-sync-pull-on-startup?)
+      (git-sync/pull!))
+    (when (state/get-mobile-git-sync-enabled?)
+      (git-sync/start-auto-push-timer!))))
 
 (defn- ios-init
   "Initialize iOS-specified event listeners"
@@ -115,6 +122,15 @@
       (when-not is-active?
         (editor-handler/save-current-block!)
         (repo-handler/persist-db!))
+      (when (mobile-util/native-android?)
+        (if is-active?
+          (when (state/get-mobile-git-sync-enabled?)
+            (git-sync/start-auto-push-timer!))
+          (do
+            ;; flush any pending edits before pausing auto-sync
+            (when (state/get-mobile-git-sync-enabled?)
+              (git-sync/commit-and-push!))
+            (git-sync/stop-auto-push-timer!))))
       (state/set-mobile-app-state-change is-active?))))
 
 (defn- general-init
