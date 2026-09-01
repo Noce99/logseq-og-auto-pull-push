@@ -195,50 +195,7 @@ public class GitSyncPlugin extends Plugin {
                 // remote's default branch WITHOUT touching working-tree files,
                 // so any pre-existing local graph files stay intact as
                 // uncommitted changes to be picked up by the next commitAndPush.
-                git.fetch().setTransportConfigCallback(cb).setTimeout(SSH_TIMEOUT_SECONDS).call();
-                Ref remoteHead = findFirstRemoteBranch(git);
-                if (remoteHead != null) {
-                    // Point HEAD at a real local branch that tracks the
-                    // remote one - not directly at the remote-tracking ref,
-                    // which confuses JGit's pull machinery ("Cannot check
-                    // out from unborn branch", confirmed on-device) since it
-                    // expects HEAD to follow refs/heads/<name> to look up
-                    // branch.<name>.{remote,merge} tracking config.
-                    String shortName = Repository.shortenRefName(remoteHead.getName()); // e.g. "origin/main"
-                    int slash = shortName.indexOf('/');
-                    String localBranchName = slash >= 0 ? shortName.substring(slash + 1) : shortName;
-
-                    // setForce(true): idempotent against a previous cold-start
-                    // attempt that created this branch but then failed before
-                    // HEAD ever became "born" - confirmed on-device:
-                    // RefAlreadyExistsException on retry without this.
-                    git.branchCreate()
-                            .setName(localBranchName)
-                            .setStartPoint(remoteHead.getName())
-                            .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.TRACK)
-                            .setForce(true)
-                            .call();
-
-                    // Materialize the remote's files ourselves (scan fully for
-                    // conflicts BEFORE writing anything) instead of using
-                    // git.checkout(), which turned out to NOT be atomic on
-                    // conflict: confirmed on-device it can delete/overwrite
-                    // unrelated working-tree files before throwing on the
-                    // file that actually conflicts. See materializeColdStart.
-                    RevCommit remoteCommit;
-                    try (RevWalk revWalk = new RevWalk(git.getRepository())) {
-                        remoteCommit = revWalk.parseCommit(remoteHead.getObjectId());
-                    }
-                    materializeColdStart(git.getRepository(), remoteCommit, git.getRepository().getWorkTree());
-
-                    String localRef = "refs/heads/" + localBranchName;
-                    git.getRepository().updateRef("HEAD").link(localRef);
-                    // Working tree now matches the remote commit exactly
-                    // (pre-existing-and-identical files untouched, missing
-                    // ones just written) - a MIXED reset only needs to update
-                    // index/HEAD bookkeeping to match, no more file writes.
-                    git.reset().setMode(ResetCommand.ResetType.MIXED).setRef(localRef).call();
-                }
+                performColdStart(git, cb);
                 resolveOk(call, false);
                 return;
             }
@@ -260,6 +217,108 @@ public class GitSyncPlugin extends Plugin {
             Log.e(TAG, "pull failed", e);
             call.reject("Pull failed: " + e.getMessage());
         }
+    }
+
+    /**
+     * Explicit "Clone repo" action from settings: unlike {@link #pull}, this
+     * creates {@code repoDir} if it doesn't exist yet (e.g. the user deleted
+     * the graph folder and wants to bring it back from the remote), then runs
+     * the same safe cold-start materialization. If the directory already has
+     * commits (e.g. clone was already done), falls back to a normal pull.
+     */
+    @PluginMethod()
+    public void cloneRepo(PluginCall call) {
+        String repoDir = call.getString("repoDir");
+        String remoteUrl = call.getString("remoteUrl");
+        if (repoDir == null || remoteUrl == null) {
+            call.reject("repoDir and remoteUrl are required");
+            return;
+        }
+        File dir = new File(repoDir);
+        if (!dir.exists() && !dir.mkdirs()) {
+            call.reject("Failed to create graph directory: " + repoDir);
+            return;
+        }
+        try (Git git = openOrInitRepo(repoDir, remoteUrl)) {
+            TransportConfigCallback cb = buildTransportConfigCallback(loadKeyMaterial());
+
+            boolean hadCommitBefore = git.getRepository().resolve("HEAD") != null;
+            if (hadCommitBefore) {
+                PullResult result = git.pull().setTransportConfigCallback(cb).setTimeout(SSH_TIMEOUT_SECONDS).call();
+                if (!result.isSuccessful()) {
+                    if (isConflict(result)) {
+                        abortConflictedMerge(git);
+                        call.reject("Merge conflict while pulling", "MERGE_CONFLICT");
+                    } else {
+                        call.reject("Pull failed: " + result);
+                    }
+                    return;
+                }
+                resolveOk(call, true);
+                return;
+            }
+
+            performColdStart(git, cb);
+            resolveOk(call, true);
+        } catch (CheckoutConflictException | ColdStartConflictException e) {
+            call.reject("Local changes conflict with remote", "MERGE_CONFLICT");
+        } catch (Exception e) {
+            Log.e(TAG, "cloneRepo failed", e);
+            call.reject("Clone failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Fetches and, if the remote has any branch, safely materializes its
+     * default branch's tree into the (possibly non-empty) working directory -
+     * see {@link #materializeColdStart}. Used for the initial "no local
+     * commits yet" case, shared by {@link #pull} and {@link #cloneRepo}.
+     */
+    private void performColdStart(Git git, TransportConfigCallback cb)
+            throws GitAPIException, IOException, ColdStartConflictException {
+        git.fetch().setTransportConfigCallback(cb).setTimeout(SSH_TIMEOUT_SECONDS).call();
+        Ref remoteHead = findFirstRemoteBranch(git);
+        if (remoteHead == null) {
+            return;
+        }
+        // Point HEAD at a real local branch that tracks the remote one - not
+        // directly at the remote-tracking ref, which confuses JGit's pull
+        // machinery ("Cannot check out from unborn branch", confirmed
+        // on-device) since it expects HEAD to follow refs/heads/<name> to
+        // look up branch.<name>.{remote,merge} tracking config.
+        String shortName = Repository.shortenRefName(remoteHead.getName()); // e.g. "origin/main"
+        int slash = shortName.indexOf('/');
+        String localBranchName = slash >= 0 ? shortName.substring(slash + 1) : shortName;
+
+        // setForce(true): idempotent against a previous cold-start attempt
+        // that created this branch but then failed before HEAD ever became
+        // "born" - confirmed on-device: RefAlreadyExistsException on retry
+        // without this.
+        git.branchCreate()
+                .setName(localBranchName)
+                .setStartPoint(remoteHead.getName())
+                .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.TRACK)
+                .setForce(true)
+                .call();
+
+        // Materialize the remote's files ourselves (scan fully for conflicts
+        // BEFORE writing anything) instead of using git.checkout(), which
+        // turned out to NOT be atomic on conflict: confirmed on-device it can
+        // delete/overwrite unrelated working-tree files before throwing on
+        // the file that actually conflicts. See materializeColdStart.
+        RevCommit remoteCommit;
+        try (RevWalk revWalk = new RevWalk(git.getRepository())) {
+            remoteCommit = revWalk.parseCommit(remoteHead.getObjectId());
+        }
+        materializeColdStart(git.getRepository(), remoteCommit, git.getRepository().getWorkTree());
+
+        String localRef = "refs/heads/" + localBranchName;
+        git.getRepository().updateRef("HEAD").link(localRef);
+        // Working tree now matches the remote commit exactly
+        // (pre-existing-and-identical files untouched, missing ones just
+        // written) - a MIXED reset only needs to update index/HEAD
+        // bookkeeping to match, no more file writes.
+        git.reset().setMode(ResetCommand.ResetType.MIXED).setRef(localRef).call();
     }
 
     @PluginMethod()

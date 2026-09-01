@@ -80,6 +80,17 @@
                     (state/set-mobile-git-sync-cfgs! {:status :ok :last-error nil :last-pulled-at (js/Date.now)})))
           (p/catch (fn [error] (show-error! error :git-sync/pull-failed)))))))
 
+(defn clone!
+  "Explicit 'Clone repo' action: creates the graph dir if it doesn't exist
+  (e.g. it was deleted) and materializes the remote's files into it."
+  []
+  (when (and git-sync (state/get-mobile-git-sync-remote-url))
+    (when-let [dir (current-repo-dir)]
+      (-> (.cloneRepo git-sync (clj->js {:repoDir dir :remoteUrl (state/get-mobile-git-sync-remote-url)}))
+          (p/then (fn [_]
+                    (state/set-mobile-git-sync-cfgs! {:status :ok :last-error nil :last-pulled-at (js/Date.now)})))
+          (p/catch (fn [error] (show-error! error :git-sync/clone-failed)))))))
+
 (defn commit-and-push!
   []
   (when (and git-sync (state/get-mobile-git-sync-remote-url) (not @*syncing?))

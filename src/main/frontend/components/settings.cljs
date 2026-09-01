@@ -863,6 +863,19 @@
                          (str (t :settings-page/git-sync-connection-failed) ": " (.-message error))
                          :error)))))))]])
 
+(rum/defc git-sync-clone-row
+  []
+  [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4.sm:items-center
+   [:label.block.text-sm.font-medium.leading-5.opacity-70 ""]
+   [:div.mt-1.sm:mt-0.sm:col-span-2
+    (ui/button
+     (t :settings-page/git-sync-clone)
+     :class "text-sm"
+     :on-click
+     (fn []
+       (when (js/confirm (t :settings-page/git-sync-clone-confirm))
+         (git-sync/clone!))))]])
+
 (rum/defc git-sync-pull-on-startup-row < rum/reactive
   []
   (let [enabled? (state/get-mobile-git-sync-pull-on-startup?)]
@@ -952,6 +965,7 @@
    (git-sync-remote-url-row)
    (git-sync-key-row)
    (git-sync-test-connection-row)
+   (git-sync-clone-row)
    (git-sync-pull-on-startup-row)
    (git-sync-enable-auto-push-row)
    (git-sync-interval-seconds-row)
