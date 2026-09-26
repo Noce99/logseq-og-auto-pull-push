@@ -57,9 +57,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Keeps the currently-open graph folder in sync with a remote git repo over
@@ -91,6 +94,10 @@ public class GitSyncPlugin extends Plugin {
     // server that never responds) hangs the calling thread forever - JGit's
     // TransportCommand.setTimeout(seconds) is respected by the JSch session.
     private static final int SSH_TIMEOUT_SECONDS = 20;
+
+    // Repo .git dirs already swept for leftover locks by this process. Static:
+    // Capacitor makes a new plugin instance when the Activity is recreated.
+    private static final Set<String> CLEANED_REPOS = new HashSet<>();
 
     // ---- Secure key storage (Keystore-backed, per-app-sandboxed) -----------
 
@@ -483,18 +490,60 @@ public class GitSyncPlugin extends Plugin {
             throw new IllegalStateException("Graph directory does not exist: " + repoDirPath);
         }
         File gitDir = new File(dir, ".git");
+        removeLeftoverLocks(gitDir);
         Git git = gitDir.exists() ? Git.open(dir) : Git.init().setDirectory(dir).call();
         ensureOrigin(git, remoteUrl);
         return git;
     }
 
+    /**
+     * If the app is killed mid-operation (swiped away, MIUI killing it during
+     * an auto-push, an APK update), JGit leaves *.lock files behind (index,
+     * config, refs...) and every later pull/commit fails with
+     * LockFailedException forever - confirmed on-device, sync was silently
+     * blocked for weeks by a leftover index.lock. All git calls here run one
+     * at a time on the plugin's thread in this process, so any lock present
+     * before this process first touches a repo is from a dead process.
+     */
+    private void removeLeftoverLocks(File gitDir) {
+        synchronized (CLEANED_REPOS) {
+            if (!gitDir.isDirectory() || !CLEANED_REPOS.add(gitDir.getAbsolutePath())) {
+                return;
+            }
+        }
+        deleteLockFiles(gitDir);
+    }
+
+    private static void deleteLockFiles(File dir) {
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            if (child.isDirectory()) {
+                if (!child.getName().equals("objects")) {
+                    deleteLockFiles(child);
+                }
+            } else if (child.getName().endsWith(".lock")) {
+                Log.w(TAG, "Removing leftover lock " + child);
+                if (!child.delete()) {
+                    Log.e(TAG, "Failed to remove leftover lock " + child);
+                }
+            }
+        }
+    }
+
     private void ensureOrigin(Git git, String remoteUrl) throws GitAPIException, java.net.URISyntaxException {
+        URIish uri = new URIish(remoteUrl);
         List<RemoteConfig> remotes = git.remoteList().call();
-        boolean hasOrigin = remotes.stream().anyMatch(r -> "origin".equals(r.getName()));
-        if (!hasOrigin) {
-            git.remoteAdd().setName("origin").setUri(new URIish(remoteUrl)).call();
-        } else {
-            git.remoteSetUrl().setRemoteName("origin").setRemoteUri(new URIish(remoteUrl)).call();
+        RemoteConfig origin = remotes.stream().filter(r -> "origin".equals(r.getName())).findFirst().orElse(null);
+        if (origin == null) {
+            git.remoteAdd().setName("origin").setUri(uri).call();
+        } else if (!origin.getURIs().equals(Collections.singletonList(uri))) {
+            // Only rewrite .git/config when the URL actually changed - this
+            // runs on every pull/push, and each write is another chance for a
+            // kill to leave config.lock behind.
+            git.remoteSetUrl().setRemoteName("origin").setRemoteUri(uri).call();
         }
     }
 
